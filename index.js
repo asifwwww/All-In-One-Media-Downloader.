@@ -1,64 +1,73 @@
 const express = require('express');
 const cors = require('cors');
-const { exec } = require('child_process');
+const ytDlp = require('yt-dlp-exec');
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-app.post('/api/download', (req, res) => {
+// Home Check
+app.get('/', (req, res) => {
+    res.send('Media Downloader API is Running Successfully!');
+});
+
+app.post('/api/download', async (req, res) => {
     const { url } = req.body;
 
     if (!url) {
         return res.status(400).json({ error: 'URL is required' });
     }
 
-    // Command to get all video/image formats & direct stream URLs without downloading to server storage
-    const command = `yt-dlp --dump-json "${url}"`;
+    try {
+        // Direct yt-dlp exec execution
+        const output = await ytDlp(url, {
+            dumpSingleJson: true,
+            noCheckCertificates: true,
+            noWarnings: true,
+            preferFreeFormats: true,
+            addHeader: [
+                'referer:youtube.com',
+                'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ]
+        });
 
-    exec(command, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
-        if (error) {
-            console.error(`Error: ${error.message}`);
-            return res.status(500).json({ error: 'Failed to extract media. Make sure URL is public.' });
+        const responseData = {
+            title: output.title || output.description || 'Downloaded Media',
+            thumbnail: output.thumbnail || (output.thumbnails ? output.thumbnails[0]?.url : ''),
+            duration: output.duration_string || '',
+            formats: []
+        };
+
+        if (output.formats && output.formats.length > 0) {
+            responseData.formats = output.formats
+                .filter(f => f.url && (f.ext === 'mp4' || f.ext === 'm4a' || f.vcodec !== 'none' || f.acodec !== 'none'))
+                .map(f => ({
+                    quality: f.format_note || f.resolution || (f.height ? `${f.height}p` : 'Standard Quality'),
+                    ext: f.ext || 'mp4',
+                    url: f.url
+                })).reverse();
+        } 
+        
+        // Agar single direct image/video url ho (Instagram/TikTok/Pinterest etc)
+        if (responseData.formats.length === 0 && output.url) {
+            responseData.formats.push({
+                quality: 'Original / HD',
+                ext: output.ext || 'mp4',
+                url: output.url
+            });
         }
 
-        try {
-            const data = JSON.parse(stdout);
-            
-            // Format response for UI
-            const responseData = {
-                title: data.title || 'Downloaded Media',
-                thumbnail: data.thumbnail || '',
-                duration: data.duration_string || '',
-                formats: []
-            };
+        return res.json(responseData);
 
-            if (data.formats) {
-                // Get available video/audio qualities
-                responseData.formats = data.formats
-                    .filter(f => f.url && (f.ext === 'mp4' || f.ext === 'm4a' || f.vcodec !== 'none'))
-                    .map(f => ({
-                        quality: f.format_note || f.resolution || 'Standard Quality',
-                        ext: f.ext,
-                        url: f.url
-                    })).reverse();
-            } else if (data.url) {
-                // Single image or video direct link
-                responseData.formats.push({
-                    quality: 'Direct Link / Original',
-                    ext: data.ext || 'jpg',
-                    url: data.url
-                });
-            }
-
-            return res.json(responseData);
-        } catch (e) {
-            return res.status(500).json({ error: 'Parsing error on backend' });
-        }
-    });
+    } catch (error) {
+        console.error('Extraction Error:', error);
+        return res.status(500).json({ 
+            error: 'Failed to extract media. Link private ho sakta hai ya platform anti-bot block kar raha hai.' 
+        });
+    }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
