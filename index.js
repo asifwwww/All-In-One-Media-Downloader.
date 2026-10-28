@@ -107,7 +107,10 @@ function explain(stderr) {
   if (/TIMEOUT/.test(s)) return { code: 'timeout', error: 'The source took too long to respond. Please try again.' };
   if (/confirm you.re not a bot|Sign in to confirm/i.test(s)) return { code: 'youtube_bot', error: 'YouTube is blocking this server right now.', hint: 'Add COOKIES_B64 or YTDLP_PROXY on Render.' };
   if (/login required|rate-limit reached|empty media response|Requested content is not available|checkpoint/i.test(s)) return { code: 'login_required', error: 'This platform requires a logged-in session for this link.', hint: 'Add COOKIES_B64 (Netscape cookies.txt) on Render.' };
-  if (/Unsupported URL/i.test(s)) return { code: 'unsupported', error: 'This link type is not supported.' };
+  if (/Unsupported URL/i.test(s)) {
+    if (/threads\.(com|net)/i.test(s)) return { code: 'threads_unsupported', error: 'Threads link could not be extracted by the server.', hint: 'Make sure the latest Docker deployment completed and the Threads yt-dlp plugin loaded. Only public video posts are supported; text/image-only posts cannot be downloaded.' };
+    return { code: 'unsupported', error: 'This link type is not supported by the current extractor.' };
+  }
   if (/private|unavailable|removed|not exist|404|deleted/i.test(s)) return { code: 'unavailable', error: 'This media is private, removed or unavailable.' };
   if (/403|Forbidden/i.test(s)) return { code: 'blocked', error: 'The platform blocked the request (HTTP 403).', hint: 'Update yt-dlp, add cookies or a proxy.' };
   return { code: 'failed', error: 'Failed to extract. Make sure the link is public and valid.' };
@@ -221,7 +224,7 @@ async function extract(url) {
 const baseOf = req => `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
 
 app.get('/', (req, res) => res.send('All-In-One Media Downloader API is running.'));
-app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, cookies: HAS_COOKIES, proxy: !!PROXY }));
+app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, cookies: HAS_COOKIES, proxy: !!PROXY, threadsPlugin: true, note: 'threadsPlugin indicates the Docker image is configured to install the Threads extractor; verify Render build logs if Threads still fails.' }));
 
 app.post('/api/download', async (req, res) => {
   if (limited('d:' + req.ip, 20, 60000)) return res.status(429).json({ error: 'Too many requests. Please wait a minute.', code: 'rate_limited' });
@@ -332,4 +335,4 @@ app.listen(PORT, () => {
   readVersion().catch(() => {});
   setTimeout(updateYtDlp, 3 * 60 * 1000).unref();   // update 3 min after boot (not during first requests)
   setInterval(updateYtDlp, 24 * 3600 * 1000).unref(); // and daily
-});
+}); 
