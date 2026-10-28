@@ -7,7 +7,7 @@
  *  GET  /health
  */
 const express = require('express');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
@@ -60,10 +60,23 @@ function semaphore(n) {
 const extractSlot = semaphore(2);
 const mergeSlot = semaphore(1);
 
+// ---------- yt-dlp binary discovery (system yt-dlp, else yt-dlp-exec's copy) ----------
+function findBin() {
+  if (process.env.YTDLP_BIN) return process.env.YTDLP_BIN;
+  const t = spawnSync('yt-dlp', ['--version'], { timeout: 20000 });
+  if (!t.error && t.status === 0) return 'yt-dlp';
+  try { const p = require('yt-dlp-exec/src/constants').YOUTUBE_DL_PATH; if (p && fs.existsSync(p)) return p; } catch (e) {}
+  const g = path.join(__dirname, 'node_modules', 'yt-dlp-exec', 'bin', 'yt-dlp');
+  return fs.existsSync(g) ? g : '';
+}
+const BIN = findBin();
+console.log('yt-dlp binary:', BIN || 'NOT FOUND');
+
 // ---------- yt-dlp runner ----------
 function run(args, timeoutMs, cap = 20 * 1024 * 1024) {
+  if (!BIN) return Promise.resolve({ code: -1, out: '', err: 'NO_YTDLP' });
   return new Promise(resolve => {
-    const p = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const p = spawn(BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '', done = false;
     const t = setTimeout(() => { if (!done) { err += '\nTIMEOUT'; p.kill('SIGKILL'); } }, timeoutMs);
     p.stdout.on('data', d => { if (out.length < cap) out += d; });
@@ -87,6 +100,7 @@ function withCookies(args) {
 }
 function explain(stderr) {
   const s = stderr || '';
+  if (/NO_YTDLP/.test(s)) return { code: 'setup', error: 'Server setup problem: yt-dlp is not installed on the server.', hint: 'Deploy with the Dockerfile (Render runtime: Docker) or add yt-dlp-exec.' };
   if (/TIMEOUT/.test(s)) return { code: 'timeout', error: 'The source took too long to respond. Please try again.' };
   if (/confirm you.re not a bot|Sign in to confirm/i.test(s)) return { code: 'youtube_bot', error: 'YouTube is blocking this server right now.', hint: 'Add COOKIES_B64 or YTDLP_PROXY on Render.' };
   if (/login required|rate-limit reached|empty media response|Requested content is not available|checkpoint/i.test(s)) return { code: 'login_required', error: 'This platform requires a logged-in session for this link.', hint: 'Add COOKIES_B64 (Netscape cookies.txt) on Render.' };
@@ -198,14 +212,14 @@ async function extract(url) {
 const baseOf = req => `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
 
 app.get('/', (req, res) => res.send('All-In-One Media Downloader API is running.'));
-app.get('/health', (req, res) => res.json({ ok: true, ytdlp: YTDLP_VERSION, cookies: HAS_COOKIES, proxy: !!PROXY }));
+app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', cookies: HAS_COOKIES, proxy: !!PROXY }));
 
 app.post('/api/download', async (req, res) => {
   if (limited('d:' + req.ip, 20, 60000)) return res.status(429).json({ error: 'Too many requests. Please wait a minute.', code: 'rate_limited' });
   const url = cleanUrl(req.body && req.body.url);
   if (!url) return res.status(400).json({ error: 'Please paste a valid link from a supported platform.', code: 'bad_url' });
   const r = await extract(url);
-  if (r.error) { console.error('extract fail:', url, r.raw || ''); return res.status(502).json(r.error); }
+  if (r.error) { console.error('extract fail:', url, r.raw || ''); return res.status(502).json({ ...r.error, detail: (r.raw || '').trim().split('\n').slice(-2).join(' ').slice(0, 220) }); }
   try { return res.json(buildResponse(r.info, baseOf(req))); }
   catch (e) { console.error('build:', e.message); return res.status(500).json({ error: 'Could not process this media.', code: 'failed' }); }
 });
@@ -260,12 +274,14 @@ app.get('/api/merge', async (req, res) => {
 let YTDLP_VERSION = '';
 async function readVersion() { const r = await run(['--version'], 15000); YTDLP_VERSION = r.out.trim(); }
 function updateYtDlp() {
-  const p = spawn('pip', ['install', '-U', '--no-cache-dir', 'yt-dlp[default]'], { stdio: 'ignore' });
+  if (!BIN || process.env.NO_UPDATE) return;
+  const p = BIN === 'yt-dlp' ? spawn('pip', ['install', '-U', '--no-cache-dir', 'yt-dlp[default]'], { stdio: 'ignore' })
+                              : spawn(BIN, ['-U'], { stdio: 'ignore' });
   p.on('close', () => readVersion().catch(() => {})); p.on('error', () => {});
 }
 app.listen(PORT, () => {
   console.log('Server running on port ' + PORT);
   readVersion().catch(() => {});
-  updateYtDlp();                                   // update on every boot
+  setTimeout(updateYtDlp, 3 * 60 * 1000).unref();   // update 3 min after boot (not during first requests)
   setInterval(updateYtDlp, 24 * 3600 * 1000).unref(); // and daily
 });
