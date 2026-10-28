@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv ffmpeg ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --no-cache-dir -U pip "yt-dlp[default]"
+ && /opt/venv/bin/pip install --no-cache-dir -U pip "yt-dlp[default]" \
+ && /opt/venv/bin/pip install --no-cache-dir "git+https://github.com/tribixbite/yt-dlp-threads.git"
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 ENV PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
 RUN printf -- "--js-runtimes deno\n" > /etc/yt-dlp.conf
