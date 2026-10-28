@@ -11,7 +11,7 @@ app.get('/', (req, res) => {
     res.send('All-In-One Media Downloader API is Running Perfectly!');
 });
 
-// 1. Metadata Fetch Endpoint
+// Metadata & Format Extraction Endpoint
 app.post('/api/download', async (req, res) => {
     const { url } = req.body;
 
@@ -20,13 +20,18 @@ app.post('/api/download', async (req, res) => {
     }
 
     try {
+        // Advanced yt-dlp arguments to bypass YouTube, Instagram, Threads, Pinterest & TikTok blocks
         const output = await ytDlp(url, {
             dumpSingleJson: true,
             noCheckCertificates: true,
             noWarnings: true,
             preferFreeFormats: true,
+            geoBypass: true,
+            extractorArgs: 'youtube:player_client=android,web',
             addHeader: [
-                'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'accept-language:en-US,en;q=0.9',
+                'sec-fetch-mode:navigate'
             ]
         });
 
@@ -34,13 +39,25 @@ app.post('/api/download', async (req, res) => {
             title: output.title || output.description || 'Downloaded Media',
             thumbnail: output.thumbnail || (output.thumbnails ? output.thumbnails[0]?.url : ''),
             duration: output.duration_string || `${output.duration || 0} sec`,
-            uploader: output.uploader || output.channel || 'Unknown Creator',
+            uploader: output.uploader || output.channel || output.creator || 'Unknown Creator',
             view_count: output.view_count ? output.view_count.toLocaleString() : 'N/A',
             videoUrl: '',
-            audioUrl: ''
+            audioUrl: '',
+            formats: []
         };
 
-        // Best video format selection
+        // Extract formats cleanly for all platforms (YouTube, Insta, TikTok, etc.)
+        if (output.formats && output.formats.length > 0) {
+            responseData.formats = output.formats
+                .filter(f => f.url && f.vcodec !== 'none')
+                .map(f => ({
+                    quality: f.format_note || f.resolution || (f.height ? `${f.height}p` : 'HD Quality'),
+                    ext: f.ext || 'mp4',
+                    url: f.url
+                }));
+        }
+
+        // Best video stream fallback
         let bestVideo = output.formats?.reverse().find(f => f.url && f.vcodec !== 'none' && f.acodec !== 'none');
         if (!bestVideo) {
             bestVideo = output.formats?.find(f => f.url && f.vcodec !== 'none');
@@ -49,11 +66,11 @@ app.post('/api/download', async (req, res) => {
         const rawVideoUrl = bestVideo ? bestVideo.url : (output.url || '');
         const rawAudioUrl = output.formats?.find(f => f.url && f.vcodec === 'none' && f.acodec !== 'none')?.url || '';
 
-        // Route URLs through our backend proxy to bypass 403 Forbidden errors
         const host = req.headers['host'];
         const protocol = req.headers['x-forwarded-proto'] || 'https';
         const serverBase = `${protocol}://${host}`;
 
+        // Proxy routing to prevent 403 Forbidden errors
         responseData.videoUrl = rawVideoUrl ? `${serverBase}/api/stream?url=${encodeURIComponent(rawVideoUrl)}` : '';
         responseData.audioUrl = rawAudioUrl ? `${serverBase}/api/stream?url=${encodeURIComponent(rawAudioUrl)}` : '';
 
@@ -62,12 +79,12 @@ app.post('/api/download', async (req, res) => {
     } catch (error) {
         console.error('Extraction Error:', error.message);
         return res.status(500).json({ 
-            error: 'Failed to extract. Ensure the link is public and from a supported platform.' 
+            error: 'Failed to extract. Make sure the link is public and valid.' 
         });
     }
 });
 
-// 2. Secure Stream / Proxy Endpoint to Bypass 403 Forbidden
+// Secure Proxy Stream Endpoint
 app.get('/api/stream', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) {
