@@ -59,6 +59,7 @@ function semaphore(n) {
 }
 const extractSlot = semaphore(2);
 const mergeSlot = semaphore(1);
+const pipeSlot = semaphore(2);
 
 // ---------- yt-dlp binary discovery (system yt-dlp, else yt-dlp-exec's copy) ----------
 function findBin() {
@@ -70,7 +71,9 @@ function findBin() {
   return fs.existsSync(g) ? g : '';
 }
 const BIN = findBin();
-console.log('yt-dlp binary:', BIN || 'NOT FOUND');
+const _ff = spawnSync('ffmpeg', ['-version'], { timeout: 8000 });
+const HAS_FFMPEG = !_ff.error && _ff.status === 0;
+console.log('yt-dlp binary:', BIN || 'NOT FOUND', '| ffmpeg:', HAS_FFMPEG);
 
 // ---------- yt-dlp runner ----------
 function run(args, timeoutMs, cap = 20 * 1024 * 1024) {
@@ -86,7 +89,7 @@ function run(args, timeoutMs, cap = 20 * 1024 * 1024) {
   });
 }
 function baseArgs(url) {
-  const a = ['--no-playlist', '--no-warnings', '--no-check-certificates', '--socket-timeout', '12', '--extractor-retries', '1',
+  const a = ['--no-playlist', '--no-warnings', '--no-check-certificates', '--socket-timeout', '20', '--extractor-retries', '2', '--retries', '3', '--fragment-retries', '3',
     '--user-agent', UA, '--add-header', 'Accept-Language:en-US,en;q=0.9'];
   if (/vimeo\.com/i.test(url)) a.push('--referer', 'https://vimeo.com/');
   if (PROXY) a.push('--proxy', PROXY);
@@ -120,12 +123,12 @@ function cleanUrl(raw) {
 
 // ---------- stream registry (id -> upstream url + headers) ----------
 const streams = new Map();
-function register(url, headers, name) {
+function register(url, headers, name, extra) {
   const id = crypto.randomBytes(12).toString('hex');
   const h = {};
   for (const [k, v] of Object.entries(headers || {})) if (!/^(host|content-length|connection|range|accept-encoding)$/i.test(k)) h[k] = String(v);
   if (!Object.keys(h).some(k => k.toLowerCase() === 'user-agent')) h['User-Agent'] = UA;
-  streams.set(id, { url, headers: h, name, exp: Date.now() + 45 * 60 * 1000 });
+  streams.set(id, { url, headers: h, name, exp: Date.now() + 45 * 60 * 1000, ...(extra || {}) });
   if (streams.size > 3000) streams.delete(streams.keys().next().value);
   return id;
 }
@@ -133,47 +136,53 @@ setInterval(() => { const now = Date.now(); for (const [k, v] of streams) if (v.
 
 // ---------- build response from yt-dlp JSON ----------
 const safeName = s => (String(s || 'media').replace(/[\\/:*?"<>|\r\n#%]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'media');
-const isProgressive = f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' &&
-  !/m3u8|dash|f4m|ism/i.test(f.protocol || '') && !/^(m3u8|mpd|f4m)$/i.test(f.ext || '');
+const isHttp = f => f && f.url && !/m3u8|dash|f4m|ism/i.test(f.protocol || '') && !/^(m3u8|mpd|f4m)$/i.test(f.ext || '');
+const hasV = f => f.vcodec !== 'none', hasA = f => f.acodec !== 'none';
 const isWatermarked = f => /watermark/i.test((f.format_note || '') + ' ' + (f.format_id || '')) || f.format_id === 'download';
+const byQuality = (a, b) => (isWatermarked(a) - isWatermarked(b)) || ((b.height || 0) - (a.height || 0)) || ((b.tbr || 0) - (a.tbr || 0));
 
-function buildResponse(info, base) {
+function buildResponse(info, base, pageUrl) {
   if (info.entries && info.entries.length) info = info.entries[0];
-  const all = info.formats && info.formats.length ? info.formats : (info.url ? [{ url: info.url, ext: info.ext, vcodec: info.vcodec, acodec: info.acodec, protocol: info.protocol, http_headers: info.http_headers, height: info.height }] : []);
+  const all = info.formats && info.formats.length ? info.formats
+    : (info.url ? [{ url: info.url, ext: info.ext, vcodec: info.vcodec, acodec: info.acodec, protocol: info.protocol, http_headers: info.http_headers, height: info.height, format_id: info.format_id || 'single' }] : []);
   const title = info.title || info.description || 'Downloaded Media';
   const name = safeName(title);
 
-  // best progressive file per height (non-watermarked first)
-  const prog = all.filter(isProgressive).sort((a, b) =>
-    (isWatermarked(a) - isWatermarked(b)) || ((b.height || 0) - (a.height || 0)) || ((b.tbr || 0) - (a.tbr || 0)));
-  const seen = new Set(); const direct = [];
-  for (const f of prog) {
-    const k = (isWatermarked(f) ? 'wm' : '') + (f.height || 0);
-    if (seen.has(k)) continue; seen.add(k);
-    direct.push(f); if (direct.length >= 6) break;
-  }
-  const mk = (f, dl, label, ext) => {
-    const id = register(f.url, f.http_headers || info.http_headers, name + '.' + (ext || f.ext || 'mp4'));
+  const mk = (f, dl, ext, mode) => {
+    const id = register(f.url || '', f.http_headers || info.http_headers, name + '.' + (ext || f.ext || 'mp4'),
+      { pageUrl, formatId: f.format_id, mode: mode || 'direct' });
     return `${base}/api/stream/${id}${dl ? '?dl=1' : ''}`;
   };
-  const formats = direct.map(f => ({
-    quality: (f.height ? f.height + 'p' : (f.format_note || 'HD')) + (isWatermarked(f) ? ' (watermark)' : ''),
-    ext: f.ext || 'mp4', size: f.filesize || f.filesize_approx || 0, kind: 'direct', url: mk(f, true)
-  }));
+  const pick = (list, n) => { const seen = new Set(); const out = [];
+    for (const f of list.sort(byQuality)) { const k = (isWatermarked(f) ? 'wm' : '') + (f.height || 0); if (seen.has(k)) continue; seen.add(k); out.push(f); if (out.length >= n) break; }
+    return out; };
 
-  // HD heights that only exist as separate video/audio (YouTube, Instagram DASH, Vimeo HLS ...)
-  const bestDirectH = direct.filter(f => !isWatermarked(f)).reduce((m, f) => Math.max(m, f.height || 0), 0);
-  const heights = [...new Set(all.filter(f => f.vcodec && f.vcodec !== 'none' && f.height).map(f => f.height))]
-    .filter(h => h > bestDirectH && h <= 1080).sort((a, b) => b - a).slice(0, 2);
-  for (const h of heights) formats.push({ quality: h + 'p HD (merged, takes longer)', ext: 'mp4', size: 0, kind: 'merge',
-    url: `${base}/api/merge?h=${h}&src=${encodeURIComponent(info.webpage_url || info.original_url || '')}` });
+  const both = pick(all.filter(f => isHttp(f) && hasV(f) && hasA(f)), 6);          // video+audio in one file
+  const vonly = pick(all.filter(f => isHttp(f) && hasV(f) && !hasA(f)), 1);         // video without sound (last resort, like the old code)
+  const lab = f => (f.height ? f.height + 'p' : (f.format_note || 'HD')) + (isWatermarked(f) ? ' (watermark)' : '');
+  const formats = both.map(f => ({ quality: lab(f), ext: f.ext || 'mp4', size: f.filesize || f.filesize_approx || 0, kind: 'direct', url: mk(f, true) }));
 
-  // audio
-  const audios = all.filter(f => f.url && f.vcodec === 'none' && f.acodec && f.acodec !== 'none' && !/m3u8|dash/i.test(f.protocol || ''))
-    .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+  // HD that exists only as separate video/audio (needs ffmpeg -> only when ffmpeg is installed)
+  const bestH = both.filter(f => !isWatermarked(f)).reduce((m, f) => Math.max(m, f.height || 0), 0);
+  const merges = HAS_FFMPEG && pageUrl ? [...new Set(all.filter(f => hasV(f) && f.height).map(f => f.height))]
+    .filter(h => h > bestH && h <= 1080).sort((a, b) => b - a).slice(0, 2) : [];
+  const mergeFormats = merges.map(h => ({ quality: h + 'p HD (merged, takes longer)', ext: 'mp4', size: 0, kind: 'merge',
+    url: `${base}/api/merge?h=${h}&src=${encodeURIComponent(pageUrl)}` }));
+  formats.push(...mergeFormats);
+
+  if (!both.length && vonly.length) {
+    formats.push({ quality: lab(vonly[0]) + ' (video only, no sound)', ext: vonly[0].ext || 'mp4', size: 0, kind: 'direct', url: mk(vonly[0], true) });
+  }
+  // Keep a server-side fallback available even when direct URLs are returned.
+  // Some platforms issue short-lived URLs or block direct proxy requests.
+  if (pageUrl) formats.push({ quality: 'Server fallback (best compatible file)', ext: 'mp4', size: 0, kind: 'pipe',
+    url: `${base}/api/stream/${register('', {}, name + '.mp4', { pageUrl, formatId: 'b/bv*', mode: 'pipe' })}?dl=1` });
+
+  const audios = all.filter(f => isHttp(f) && !hasV(f) && hasA(f)).sort((a, b) => (b.abr || 0) - (a.abr || 0));
   const aud = audios.find(f => /m4a|mp3|mp4/.test(f.ext || '')) || audios[0];
 
-  const best = direct[0];
+  const best = both[0] || vonly[0];
+  const first = both[0] ? formats[0] : (mergeFormats[0] || formats.find(f => f.kind === 'pipe') || formats[0]);
   return {
     title,
     thumbnail: info.thumbnail || (info.thumbnails && info.thumbnails.length ? info.thumbnails[info.thumbnails.length - 1].url : ''),
@@ -183,8 +192,8 @@ function buildResponse(info, base) {
     like_count: info.like_count || 0,
     source: info.extractor_key || info.extractor || '',
     videoUrl: best ? mk(best, false) : '',
-    downloadUrl: best ? mk(best, true) : (formats[0] ? formats[0].url : ''),
-    audioUrl: aud ? mk(aud, true, '', aud.ext === 'webm' ? 'webm' : 'm4a') : '',
+    downloadUrl: first ? first.url : '',
+    audioUrl: aud ? mk(aud, true, aud.ext === 'webm' ? 'webm' : 'm4a') : '',
     formats
   };
 }
@@ -212,7 +221,7 @@ async function extract(url) {
 const baseOf = req => `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
 
 app.get('/', (req, res) => res.send('All-In-One Media Downloader API is running.'));
-app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', cookies: HAS_COOKIES, proxy: !!PROXY }));
+app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, cookies: HAS_COOKIES, proxy: !!PROXY }));
 
 app.post('/api/download', async (req, res) => {
   if (limited('d:' + req.ip, 20, 60000)) return res.status(429).json({ error: 'Too many requests. Please wait a minute.', code: 'rate_limited' });
@@ -220,30 +229,69 @@ app.post('/api/download', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'Please paste a valid link from a supported platform.', code: 'bad_url' });
   const r = await extract(url);
   if (r.error) { console.error('extract fail:', url, r.raw || ''); return res.status(502).json({ ...r.error, detail: (r.raw || '').trim().split('\n').slice(-2).join(' ').slice(0, 220) }); }
-  try { return res.json(buildResponse(r.info, baseOf(req))); }
+  try { return res.json(buildResponse(r.info, baseOf(req), url)); }
   catch (e) { console.error('build:', e.message); return res.status(500).json({ error: 'Could not process this media.', code: 'failed' }); }
 });
+
+const MIME = { mp4: 'video/mp4', webm: 'video/webm', m4a: 'audio/mp4', mp3: 'audio/mpeg', mov: 'video/quicktime' };
+function dispo(s, req) {
+  const n = (req.query.name ? safeName(req.query.name) + path.extname(s.name) : s.name);
+  return `attachment; filename="${n.replace(/[^\x20-\x7E]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(n)}`;
+}
+// Let yt-dlp itself fetch the media (same cookies/headers it used while extracting) and pipe it to the client.
+function pipeYtDlp(req, res, s) {
+  return pipeSlot(() => new Promise(resolve => {
+    if (!BIN) { if (!res.headersSent) res.status(502).send('Server setup problem: yt-dlp missing.'); return resolve(); }
+    // Re-extract from the original page at download time. Cached metadata can
+    // contain expired signed media URLs and cause the fallback to fail too.
+    const args = [...baseArgs(s.pageUrl), '-f', s.formatId || 'b/bv*', '-q', '--no-progress', '-o', '-', s.pageUrl];
+    const c = withCookies(args);
+    const p = spawn(BIN, c.args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let started = false, err = '';
+    const done = () => { clearTimeout(kill); c.cleanup(); resolve(); };
+    const kill = setTimeout(() => p.kill('SIGKILL'), 10 * 60 * 1000);
+    res.on('close', () => p.kill('SIGKILL'));
+    p.stderr.on('data', d => { if (err.length < 4000) err += d; });
+    p.stdout.once('data', first => {
+      started = true;
+      res.status(200);
+      res.setHeader('Content-Type', MIME[(path.extname(s.name) || '').slice(1)] || 'video/mp4');
+      res.setHeader('Cache-Control', 'no-store');
+      if (req.query.dl) res.setHeader('Content-Disposition', dispo(s, req));
+      res.write(first); p.stdout.pipe(res);
+    });
+    p.on('error', () => {});
+    p.on('close', code => {
+      if (!started && !res.headersSent) { console.error('pipe fail:', s.pageUrl, err.slice(-300)); res.status(502).send(explain(err).error); }
+      else if (started && code !== 0) res.destroy();
+      done();
+    });
+  }));
+}
 
 app.get('/api/stream/:id', async (req, res) => {
   const s = streams.get(req.params.id);
   if (!s) return res.status(410).send('Link expired. Fetch the video again.');
+  if (s.mode === 'pipe' || !s.url) return pipeYtDlp(req, res, s);
   const ctrl = new AbortController();
   res.on('close', () => ctrl.abort());
   try {
     const h = { ...s.headers }; if (req.headers.range) h.Range = req.headers.range;
     const up = await fetch(s.url, { headers: h, signal: ctrl.signal, redirect: 'follow' });
-    if (!up.ok && up.status !== 206) return res.status(502).send('Source returned ' + up.status);
+    if (!up.ok && up.status !== 206) throw new Error('upstream ' + up.status);
     res.status(up.status);
     res.setHeader('Content-Type', up.headers.get('content-type') || 'video/mp4');
     for (const k of ['content-length', 'content-range']) { const v = up.headers.get(k); if (v) res.setHeader(k, v); }
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'no-store');
-    if (req.query.dl) {
-      const n = (req.query.name ? safeName(req.query.name) + path.extname(s.name) : s.name);
-      res.setHeader('Content-Disposition', `attachment; filename="${n.replace(/[^\x20-\x7E]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(n)}`);
-    }
+    if (req.query.dl) res.setHeader('Content-Disposition', dispo(s, req));
     Readable.fromWeb(up.body).on('error', () => res.destroy()).pipe(res);
-  } catch (e) { if (!res.headersSent) res.status(502).send('Download failed.'); else res.destroy(); }
+  } catch (e) {
+    if (res.headersSent) return res.destroy();
+    console.error('direct stream failed (' + e.message + ') -> yt-dlp pipe');
+    if (s.pageUrl) return pipeYtDlp(req, res, { ...s, formatId: 'b/bv*', mode: 'pipe' });
+    res.status(502).send('Download failed.');
+  }
 });
 
 app.get('/api/merge', async (req, res) => {
