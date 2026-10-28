@@ -1,126 +1,271 @@
+'use strict';
+/**
+ * All-In-One Media Downloader API  (Render + Docker + yt-dlp)
+ *  POST /api/download   { url }            -> details + download links (fast, cached)
+ *  GET  /api/stream/:id ?dl=1&name=        -> proxies a media URL with the right headers (fixes TikTok 403)
+ *  GET  /api/merge      ?src=<url>&h=1080  -> yt-dlp+ffmpeg merge for HD when no direct file exists
+ *  GET  /health
+ */
 const express = require('express');
-const cors = require('cors');
-const ytDlp = require('yt-dlp-exec');
-const axios = require('axios');
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-app.get('/', (req, res) => {
-    res.send('All-In-One Media Downloader API is Running Perfectly!');
-});
-
-// Metadata & Format Extraction Endpoint
-app.post('/api/download', async (req, res) => {
-    const { url } = req.body;
-
-    if (!url) {
-        return res.status(400).json({ error: 'URL is required' });
-    }
-
-    try {
-        // Advanced yt-dlp arguments to bypass YouTube, Instagram, Threads, Pinterest & TikTok blocks
-        const output = await ytDlp(url, {
-            dumpSingleJson: true,
-            noCheckCertificates: true,
-            noWarnings: true,
-            preferFreeFormats: true,
-            geoBypass: true,
-            extractorArgs: 'youtube:player_client=android,web',
-            addHeader: [
-                'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'accept-language:en-US,en;q=0.9',
-                'sec-fetch-mode:navigate'
-            ]
-        });
-
-        const responseData = {
-            title: output.title || output.description || 'Downloaded Media',
-            thumbnail: output.thumbnail || (output.thumbnails ? output.thumbnails[0]?.url : ''),
-            duration: output.duration_string || `${output.duration || 0} sec`,
-            uploader: output.uploader || output.channel || output.creator || 'Unknown Creator',
-            view_count: output.view_count ? output.view_count.toLocaleString() : 'N/A',
-            videoUrl: '',
-            audioUrl: '',
-            formats: []
-        };
-
-        // Extract formats cleanly for all platforms (YouTube, Insta, TikTok, etc.)
-        if (output.formats && output.formats.length > 0) {
-            responseData.formats = output.formats
-                .filter(f => f.url && f.vcodec !== 'none')
-                .map(f => ({
-                    quality: f.format_note || f.resolution || (f.height ? `${f.height}p` : 'HD Quality'),
-                    ext: f.ext || 'mp4',
-                    url: f.url
-                }));
-        }
-
-        // Best video stream fallback
-        let bestVideo = output.formats?.reverse().find(f => f.url && f.vcodec !== 'none' && f.acodec !== 'none');
-        if (!bestVideo) {
-            bestVideo = output.formats?.find(f => f.url && f.vcodec !== 'none');
-        }
-
-        const rawVideoUrl = bestVideo ? bestVideo.url : (output.url || '');
-        const rawAudioUrl = output.formats?.find(f => f.url && f.vcodec === 'none' && f.acodec !== 'none')?.url || '';
-
-        const host = req.headers['host'];
-        const protocol = req.headers['x-forwarded-proto'] || 'https';
-        const serverBase = `${protocol}://${host}`;
-
-        // Proxy routing to prevent 403 Forbidden errors
-        responseData.videoUrl = rawVideoUrl ? `${serverBase}/api/stream?url=${encodeURIComponent(rawVideoUrl)}` : '';
-        responseData.audioUrl = rawAudioUrl ? `${serverBase}/api/stream?url=${encodeURIComponent(rawAudioUrl)}` : '';
-
-        return res.json(responseData);
-
-    } catch (error) {
-        console.error('Extraction Error:', error.message);
-        return res.status(500).json({ 
-            error: 'Failed to extract. Make sure the link is public and valid.' 
-        });
-    }
-});
-
-// Secure Proxy Stream Endpoint
-app.get('/api/stream', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) {
-        return res.status(400).send('Target URL missing');
-    }
-
-    try {
-        const response = await axios({
-            method: 'get',
-            url: targetUrl,
-            responseType: 'stream',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Range': req.headers.range || 'bytes=0-'
-            }
-        });
-
-        res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
-        if (response.headers['content-length']) {
-            res.setHeader('Content-Length', response.headers['content-length']);
-        }
-        if (response.headers['content-range']) {
-            res.setHeader('Content-Range', response.headers['content-range']);
-            res.status(206);
-        }
-        res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Content-Disposition', 'attachment; filename="downloaded-media.mp4"');
-
-        response.data.pipe(res);
-    } catch (err) {
-        console.error('Streaming Error:', err.message);
-        res.status(500).send('Failed to download media stream.');
-    }
-});
+const { spawn } = require('child_process');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { Readable } = require('stream');
 
 const PORT = process.env.PORT || 10000;
+const ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
+const PROXY = process.env.YTDLP_PROXY || '';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const HOSTS = /(^|\.)(tiktok\.com|instagram\.com|facebook\.com|fb\.watch|fb\.com|youtube\.com|youtu\.be|x\.com|twitter\.com|reddit\.com|redd\.it|pinterest\.[a-z.]+|pin\.it|snapchat\.com|threads\.net|threads\.com|vimeo\.com)$/i;
+
+// ---------- cookies (optional) ----------
+const COOKIES_FILE = path.join(os.tmpdir(), 'cookies-master.txt');
+let HAS_COOKIES = false;
+if (process.env.COOKIES_B64) {
+  try { fs.writeFileSync(COOKIES_FILE, Buffer.from(process.env.COOKIES_B64, 'base64')); HAS_COOKIES = true; } catch (e) { console.error('cookies:', e.message); }
+}
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '10kb' }));
+app.use((req, res, next) => {
+  const o = req.headers.origin;
+  if (ORIGINS.includes('*')) res.setHeader('Access-Control-Allow-Origin', '*');
+  else if (o && ORIGINS.includes(o)) { res.setHeader('Access-Control-Allow-Origin', o); res.setHeader('Vary', 'Origin'); }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Disposition');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ---------- tiny rate limiter ----------
+const hits = new Map();
+function limited(ip, max, windowMs) {
+  const now = Date.now(); const arr = (hits.get(ip) || []).filter(t => now - t < windowMs);
+  arr.push(now); hits.set(ip, arr); return arr.length > max;
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of hits) if (!v.some(t => now - t < 120000)) hits.delete(k); }, 60000).unref();
+
+// ---------- concurrency (free instance = 0.1 CPU) ----------
+function semaphore(n) {
+  let active = 0; const q = [];
+  const next = () => { if (active < n && q.length) { active++; q.shift()(); } };
+  return fn => new Promise((resolve, reject) => {
+    q.push(() => fn().then(resolve, reject).finally(() => { active--; next(); })); next();
+  });
+}
+const extractSlot = semaphore(2);
+const mergeSlot = semaphore(1);
+
+// ---------- yt-dlp runner ----------
+function run(args, timeoutMs, cap = 20 * 1024 * 1024) {
+  return new Promise(resolve => {
+    const p = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '', done = false;
+    const t = setTimeout(() => { if (!done) { err += '\nTIMEOUT'; p.kill('SIGKILL'); } }, timeoutMs);
+    p.stdout.on('data', d => { if (out.length < cap) out += d; });
+    p.stderr.on('data', d => { if (err.length < 20000) err += d; });
+    p.on('error', e => { err += '\n' + e.message; });
+    p.on('close', code => { done = true; clearTimeout(t); resolve({ code, out, err }); });
+  });
+}
+function baseArgs(url) {
+  const a = ['--no-playlist', '--no-warnings', '--no-check-certificates', '--socket-timeout', '12', '--extractor-retries', '1',
+    '--user-agent', UA, '--add-header', 'Accept-Language:en-US,en;q=0.9'];
+  if (/vimeo\.com/i.test(url)) a.push('--referer', 'https://vimeo.com/');
+  if (PROXY) a.push('--proxy', PROXY);
+  return a;
+}
+function withCookies(args) {
+  if (!HAS_COOKIES) return { args, cleanup() {} };
+  const f = path.join(os.tmpdir(), 'c-' + crypto.randomBytes(6).toString('hex') + '.txt');
+  try { fs.copyFileSync(COOKIES_FILE, f); } catch (e) { return { args, cleanup() {} }; }
+  return { args: [...args, '--cookies', f], cleanup() { fs.unlink(f, () => {}); } };
+}
+function explain(stderr) {
+  const s = stderr || '';
+  if (/TIMEOUT/.test(s)) return { code: 'timeout', error: 'The source took too long to respond. Please try again.' };
+  if (/confirm you.re not a bot|Sign in to confirm/i.test(s)) return { code: 'youtube_bot', error: 'YouTube is blocking this server right now.', hint: 'Add COOKIES_B64 or YTDLP_PROXY on Render.' };
+  if (/login required|rate-limit reached|empty media response|Requested content is not available|checkpoint/i.test(s)) return { code: 'login_required', error: 'This platform requires a logged-in session for this link.', hint: 'Add COOKIES_B64 (Netscape cookies.txt) on Render.' };
+  if (/Unsupported URL/i.test(s)) return { code: 'unsupported', error: 'This link type is not supported.' };
+  if (/private|unavailable|removed|not exist|404|deleted/i.test(s)) return { code: 'unavailable', error: 'This media is private, removed or unavailable.' };
+  if (/403|Forbidden/i.test(s)) return { code: 'blocked', error: 'The platform blocked the request (HTTP 403).', hint: 'Update yt-dlp, add cookies or a proxy.' };
+  return { code: 'failed', error: 'Failed to extract. Make sure the link is public and valid.' };
+}
+
+// ---------- url validation ----------
+function cleanUrl(raw) {
+  if (typeof raw !== 'string' || raw.length > 2000) return null;
+  let u; try { u = new URL(raw.trim()); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol) || !HOSTS.test(u.hostname)) return null;
+  return u.toString();
+}
+
+// ---------- stream registry (id -> upstream url + headers) ----------
+const streams = new Map();
+function register(url, headers, name) {
+  const id = crypto.randomBytes(12).toString('hex');
+  const h = {};
+  for (const [k, v] of Object.entries(headers || {})) if (!/^(host|content-length|connection|range|accept-encoding)$/i.test(k)) h[k] = String(v);
+  if (!Object.keys(h).some(k => k.toLowerCase() === 'user-agent')) h['User-Agent'] = UA;
+  streams.set(id, { url, headers: h, name, exp: Date.now() + 45 * 60 * 1000 });
+  if (streams.size > 3000) streams.delete(streams.keys().next().value);
+  return id;
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of streams) if (v.exp < now) streams.delete(k); }, 60000).unref();
+
+// ---------- build response from yt-dlp JSON ----------
+const safeName = s => (String(s || 'media').replace(/[\\/:*?"<>|\r\n#%]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'media');
+const isProgressive = f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' &&
+  !/m3u8|dash|f4m|ism/i.test(f.protocol || '') && !/^(m3u8|mpd|f4m)$/i.test(f.ext || '');
+const isWatermarked = f => /watermark/i.test((f.format_note || '') + ' ' + (f.format_id || '')) || f.format_id === 'download';
+
+function buildResponse(info, base) {
+  if (info.entries && info.entries.length) info = info.entries[0];
+  const all = info.formats && info.formats.length ? info.formats : (info.url ? [{ url: info.url, ext: info.ext, vcodec: info.vcodec, acodec: info.acodec, protocol: info.protocol, http_headers: info.http_headers, height: info.height }] : []);
+  const title = info.title || info.description || 'Downloaded Media';
+  const name = safeName(title);
+
+  // best progressive file per height (non-watermarked first)
+  const prog = all.filter(isProgressive).sort((a, b) =>
+    (isWatermarked(a) - isWatermarked(b)) || ((b.height || 0) - (a.height || 0)) || ((b.tbr || 0) - (a.tbr || 0)));
+  const seen = new Set(); const direct = [];
+  for (const f of prog) {
+    const k = (isWatermarked(f) ? 'wm' : '') + (f.height || 0);
+    if (seen.has(k)) continue; seen.add(k);
+    direct.push(f); if (direct.length >= 6) break;
+  }
+  const mk = (f, dl, label, ext) => {
+    const id = register(f.url, f.http_headers || info.http_headers, name + '.' + (ext || f.ext || 'mp4'));
+    return `${base}/api/stream/${id}${dl ? '?dl=1' : ''}`;
+  };
+  const formats = direct.map(f => ({
+    quality: (f.height ? f.height + 'p' : (f.format_note || 'HD')) + (isWatermarked(f) ? ' (watermark)' : ''),
+    ext: f.ext || 'mp4', size: f.filesize || f.filesize_approx || 0, kind: 'direct', url: mk(f, true)
+  }));
+
+  // HD heights that only exist as separate video/audio (YouTube, Instagram DASH, Vimeo HLS ...)
+  const bestDirectH = direct.filter(f => !isWatermarked(f)).reduce((m, f) => Math.max(m, f.height || 0), 0);
+  const heights = [...new Set(all.filter(f => f.vcodec && f.vcodec !== 'none' && f.height).map(f => f.height))]
+    .filter(h => h > bestDirectH && h <= 1080).sort((a, b) => b - a).slice(0, 2);
+  for (const h of heights) formats.push({ quality: h + 'p HD (merged, takes longer)', ext: 'mp4', size: 0, kind: 'merge',
+    url: `${base}/api/merge?h=${h}&src=${encodeURIComponent(info.webpage_url || info.original_url || '')}` });
+
+  // audio
+  const audios = all.filter(f => f.url && f.vcodec === 'none' && f.acodec && f.acodec !== 'none' && !/m3u8|dash/i.test(f.protocol || ''))
+    .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+  const aud = audios.find(f => /m4a|mp3|mp4/.test(f.ext || '')) || audios[0];
+
+  const best = direct[0];
+  return {
+    title,
+    thumbnail: info.thumbnail || (info.thumbnails && info.thumbnails.length ? info.thumbnails[info.thumbnails.length - 1].url : ''),
+    duration: info.duration_string || (info.duration ? Math.round(info.duration) + ' sec' : '-'),
+    uploader: info.uploader || info.channel || info.creator || info.uploader_id || '-',
+    view_count: info.view_count ? Number(info.view_count).toLocaleString('en-US') : '-',
+    like_count: info.like_count || 0,
+    source: info.extractor_key || info.extractor || '',
+    videoUrl: best ? mk(best, false) : '',
+    downloadUrl: best ? mk(best, true) : (formats[0] ? formats[0].url : ''),
+    audioUrl: aud ? mk(aud, true, '', aud.ext === 'webm' ? 'webm' : 'm4a') : '',
+    formats
+  };
+}
+
+// ---------- cache + in-flight de-dupe ----------
+const cache = new Map(); const inflight = new Map();
+function cacheGet(k) { const c = cache.get(k); if (c && c.exp > Date.now()) return c.info; cache.delete(k); return null; }
+function cacheSet(k, info) { cache.set(k, { info, exp: Date.now() + 10 * 60 * 1000 }); if (cache.size > 150) cache.delete(cache.keys().next().value); }
+
+async function extract(url) {
+  const hit = cacheGet(url); if (hit) return { info: hit };
+  if (inflight.has(url)) return inflight.get(url);
+  const job = extractSlot(async () => {
+    const c = withCookies([...baseArgs(url), '-J', '--skip-download', url]);
+    try {
+      const r = await run(c.args, 45000);
+      if (r.code !== 0 || !r.out.trim()) return { error: explain(r.err), raw: r.err.slice(-400) };
+      try { const info = JSON.parse(r.out); cacheSet(url, info); return { info }; }
+      catch { return { error: explain('') }; }
+    } finally { c.cleanup(); }
+  }).finally(() => inflight.delete(url));
+  inflight.set(url, job); return job;
+}
+
+const baseOf = req => `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
+
+app.get('/', (req, res) => res.send('All-In-One Media Downloader API is running.'));
+app.get('/health', (req, res) => res.json({ ok: true, ytdlp: YTDLP_VERSION, cookies: HAS_COOKIES, proxy: !!PROXY }));
+
+app.post('/api/download', async (req, res) => {
+  if (limited('d:' + req.ip, 20, 60000)) return res.status(429).json({ error: 'Too many requests. Please wait a minute.', code: 'rate_limited' });
+  const url = cleanUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'Please paste a valid link from a supported platform.', code: 'bad_url' });
+  const r = await extract(url);
+  if (r.error) { console.error('extract fail:', url, r.raw || ''); return res.status(502).json(r.error); }
+  try { return res.json(buildResponse(r.info, baseOf(req))); }
+  catch (e) { console.error('build:', e.message); return res.status(500).json({ error: 'Could not process this media.', code: 'failed' }); }
+});
+
+app.get('/api/stream/:id', async (req, res) => {
+  const s = streams.get(req.params.id);
+  if (!s) return res.status(410).send('Link expired. Fetch the video again.');
+  const ctrl = new AbortController();
+  res.on('close', () => ctrl.abort());
+  try {
+    const h = { ...s.headers }; if (req.headers.range) h.Range = req.headers.range;
+    const up = await fetch(s.url, { headers: h, signal: ctrl.signal, redirect: 'follow' });
+    if (!up.ok && up.status !== 206) return res.status(502).send('Source returned ' + up.status);
+    res.status(up.status);
+    res.setHeader('Content-Type', up.headers.get('content-type') || 'video/mp4');
+    for (const k of ['content-length', 'content-range']) { const v = up.headers.get(k); if (v) res.setHeader(k, v); }
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.query.dl) {
+      const n = (req.query.name ? safeName(req.query.name) + path.extname(s.name) : s.name);
+      res.setHeader('Content-Disposition', `attachment; filename="${n.replace(/[^\x20-\x7E]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(n)}`);
+    }
+    Readable.fromWeb(up.body).on('error', () => res.destroy()).pipe(res);
+  } catch (e) { if (!res.headersSent) res.status(502).send('Download failed.'); else res.destroy(); }
+});
+
+app.get('/api/merge', async (req, res) => {
+  if (limited('m:' + req.ip, 4, 60000)) return res.status(429).send('Too many merge requests. Please wait.');
+  const url = cleanUrl(req.query.src); const h = parseInt(req.query.h, 10);
+  if (!url || !(h >= 144 && h <= 1080)) return res.status(400).send('Bad request');
+  mergeSlot(async () => {
+    const id = crypto.randomBytes(6).toString('hex'); const tmp = path.join(os.tmpdir(), 'm-' + id);
+    const c = withCookies([...baseArgs(url), '-f', `bv*[height<=${h}]+ba/b[height<=${h}]/b`, '--merge-output-format', 'mp4',
+      '--max-filesize', '200M', '-o', tmp + '.%(ext)s', url]);
+    let file = '';
+    try {
+      const r = await run(c.args, 240000);
+      file = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('m-' + id) && /\.(mp4|mkv|webm)$/.test(f)).map(f => path.join(os.tmpdir(), f))[0] || '';
+      if (r.code !== 0 || !file) { if (!res.headersSent) res.status(502).send(explain(r.err).error); return; }
+      const st = fs.statSync(file);
+      res.setHeader('Content-Type', 'video/mp4'); res.setHeader('Content-Length', st.size);
+      res.setHeader('Content-Disposition', `attachment; filename="video-${h}p.mp4"`);
+      await new Promise(done => { const rs = fs.createReadStream(file); rs.on('error', done); res.on('close', done); rs.on('end', done); rs.pipe(res); });
+    } finally {
+      c.cleanup();
+      fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('m-' + id)).forEach(f => fs.unlink(path.join(os.tmpdir(), f), () => {}));
+    }
+  }).catch(() => { if (!res.headersSent) res.status(500).send('Merge failed.'); });
+});
+
+// ---------- yt-dlp version + auto update ----------
+let YTDLP_VERSION = '';
+async function readVersion() { const r = await run(['--version'], 15000); YTDLP_VERSION = r.out.trim(); }
+function updateYtDlp() {
+  const p = spawn('pip', ['install', '-U', '--no-cache-dir', 'yt-dlp[default]'], { stdio: 'ignore' });
+  p.on('close', () => readVersion().catch(() => {})); p.on('error', () => {});
+}
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  console.log('Server running on port ' + PORT);
+  readVersion().catch(() => {});
+  updateYtDlp();                                   // update on every boot
+  setInterval(updateYtDlp, 24 * 3600 * 1000).unref(); // and daily
 });
