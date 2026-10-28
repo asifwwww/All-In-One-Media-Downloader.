@@ -12,7 +12,7 @@ RUN printf -- "--js-runtimes deno\n" > /etc/yt-dlp.conf
 
 WORKDIR /app
 COPY package.json ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev --omit=optional
 COPY index.js ./
 ENV NODE_ENV=production
 EXPOSE 10000
