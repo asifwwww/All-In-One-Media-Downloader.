@@ -1,15 +1,17 @@
 const express = require('express');
 const cors = require('cors');
 const ytDlp = require('yt-dlp-exec');
+const axios = require('axios');
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
-    res.send('All-In-One Media Downloader API is Running!');
+    res.send('All-In-One Media Downloader API is Running Perfectly!');
 });
 
+// 1. Metadata Fetch Endpoint
 app.post('/api/download', async (req, res) => {
     const { url } = req.body;
 
@@ -18,7 +20,6 @@ app.post('/api/download', async (req, res) => {
     }
 
     try {
-        // Fast metadata & format extraction with robust user-agent headers
         const output = await ytDlp(url, {
             dumpSingleJson: true,
             noCheckCertificates: true,
@@ -35,34 +36,26 @@ app.post('/api/download', async (req, res) => {
             duration: output.duration_string || `${output.duration || 0} sec`,
             uploader: output.uploader || output.channel || 'Unknown Creator',
             view_count: output.view_count ? output.view_count.toLocaleString() : 'N/A',
-            like_count: output.like_count ? output.like_count.toLocaleString() : 'N/A',
             videoUrl: '',
-            audioUrl: '',
-            formats: []
+            audioUrl: ''
         };
 
-        // Find best video stream with audio or separate
+        // Best video format selection
         let bestVideo = output.formats?.reverse().find(f => f.url && f.vcodec !== 'none' && f.acodec !== 'none');
         if (!bestVideo) {
             bestVideo = output.formats?.find(f => f.url && f.vcodec !== 'none');
         }
 
-        responseData.videoUrl = bestVideo ? bestVideo.url : (output.url || '');
-        
-        // Audio stream filter
-        const bestAudio = output.formats?.find(f => f.url && f.vcodec === 'none' && f.acodec !== 'none');
-        responseData.audioUrl = bestAudio ? bestAudio.url : '';
+        const rawVideoUrl = bestVideo ? bestVideo.url : (output.url || '');
+        const rawAudioUrl = output.formats?.find(f => f.url && f.vcodec === 'none' && f.acodec !== 'none')?.url || '';
 
-        // All available qualities list
-        if (output.formats) {
-            responseData.formats = output.formats
-                .filter(f => f.url && f.vcodec !== 'none')
-                .map(f => ({
-                    quality: f.format_note || f.resolution || (f.height ? `${f.height}p` : 'HD Quality'),
-                    ext: f.ext || 'mp4',
-                    url: f.url
-                }));
-        }
+        // Route URLs through our backend proxy to bypass 403 Forbidden errors
+        const host = req.headers['host'];
+        const protocol = req.headers['x-forwarded-proto'] || 'https';
+        const serverBase = `${protocol}://${host}`;
+
+        responseData.videoUrl = rawVideoUrl ? `${serverBase}/api/stream?url=${encodeURIComponent(rawVideoUrl)}` : '';
+        responseData.audioUrl = rawAudioUrl ? `${serverBase}/api/stream?url=${encodeURIComponent(rawAudioUrl)}` : '';
 
         return res.json(responseData);
 
@@ -71,6 +64,42 @@ app.post('/api/download', async (req, res) => {
         return res.status(500).json({ 
             error: 'Failed to extract. Ensure the link is public and from a supported platform.' 
         });
+    }
+});
+
+// 2. Secure Stream / Proxy Endpoint to Bypass 403 Forbidden
+app.get('/api/stream', async (req, res) => {
+    const targetUrl = req.query.url;
+    if (!targetUrl) {
+        return res.status(400).send('Target URL missing');
+    }
+
+    try {
+        const response = await axios({
+            method: 'get',
+            url: targetUrl,
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Range': req.headers.range || 'bytes=0-'
+            }
+        });
+
+        res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
+        if (response.headers['content-length']) {
+            res.setHeader('Content-Length', response.headers['content-length']);
+        }
+        if (response.headers['content-range']) {
+            res.setHeader('Content-Range', response.headers['content-range']);
+            res.status(206);
+        }
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Disposition', 'attachment; filename="downloaded-media.mp4"');
+
+        response.data.pipe(res);
+    } catch (err) {
+        console.error('Streaming Error:', err.message);
+        res.status(500).send('Failed to download media stream.');
     }
 });
 
