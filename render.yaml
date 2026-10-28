@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: video-downloader-api
+    env: node
+    buildCommand: "npm install && apt-get update && apt-get install -y python3 ffmpeg"
+    startCommand: "npm start"
