@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>All-In-One Fast Media Downloader</title>
+    <style>
+        * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { background: #0f172a; color: #fff; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .container { background: #1e293b; padding: 30px; border-radius: 12px; max-width: 600px; width: 100%; box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; }
+        h1 { color: #38bdf8; margin-bottom: 8px; }
+        p { color: #94a3b8; font-size: 14px; margin-bottom: 20px; }
+        .input-group { display: flex; gap: 10px; margin-bottom: 20px; }
+        input { flex: 1; padding: 12px 15px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; font-size: 16px; outline: none; }
+        button { background: #0284c7; color: white; border: none; padding: 12px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.3s; }
+        button:hover { background: #0369a1; }
+        .result-card { display: none; background: #0f172a; border-radius: 8px; padding: 15px; margin-top: 20px; text-align: left; }
+        .result-card img { width: 100%; border-radius: 6px; margin-bottom: 10px; }
+        .download-btn { display: block; width: 100%; background: #22c55e; color: white; text-align: center; padding: 10px; border-radius: 6px; text-decoration: none; font-weight: bold; margin-top: 8px; }
+        .download-btn:hover { background: #16a34a; }
+        .loader { display: none; color: #38bdf8; margin: 15px 0; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>All-In-One Downloader</h1>
+    <p>Download Videos, Reels, Stories & Images from Insta, FB, YouTube, Twitter, Reddit, Pinterest, Snapchat, Threads & Vimeo.</p>
+    
+    <div class="input-group">
+        <input type="text" id="mediaUrl" placeholder="Paste link here..." />
+        <button onclick="fetchMedia()">Fetch</button>
+    </div>
+
+    <div class="loader" id="loader">Processing request, please wait...</div>
+
+    <div class="result-card" id="resultCard">
+        <img id="thumb" src="" alt="Thumbnail">
+        <h3 id="title"></h3>
+        <div id="downloadLinks"></div>
+    </div>
+</div>
+
+<script>
+    // Replace this URL with your Render Backend URL once deployed
+    const RENDER_API_URL = "https://your-render-app-name.onrender.com/api/download";
+
+    async function fetchMedia() {
+        const url = document.getElementById('mediaUrl').value;
+        const loader = document.getElementById('loader');
+        const resultCard = document.getElementById('resultCard');
+        const downloadLinks = document.getElementById('downloadLinks');
+
+        if (!url) {
+            alert('Please paste a link!');
+            return;
+        }
+
+        loader.style.display = 'block';
+        resultCard.style.display = 'none';
+        downloadLinks.innerHTML = '';
+
+        try {
+            const response = await fetch(RENDER_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url })
+            });
+
+            const data = await response.json();
+            loader.style.display = 'none';
+
+            if (data.error) {
+                alert(data.error);
+                return;
+            }
+
+            document.getElementById('title').innerText = data.title;
+            if (data.thumbnail) {
+                document.getElementById('thumb').src = data.thumbnail;
+                document.getElementById('thumb').style.display = 'block';
+            } else {
+                document.getElementById('thumb').style.display = 'none';
+            }
+
+            data.formats.slice(0, 5).forEach(item => {
+                const a = document.createElement('a');
+                a.className = 'download-btn';
+                a.href = item.url;
+                a.target = '_blank';
+                a.innerText = `Download ${item.quality} (${item.ext.toUpperCase()})`;
+                downloadLinks.appendChild(a);
+            });
+
+            resultCard.style.display = 'block';
+
+        } catch (err) {
+            loader.style.display = 'none';
+            alert('Failed to connect to backend server. Make sure Render service is awake.');
+        }
+    }
+</script>
+
+</body>
+</html>
