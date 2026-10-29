@@ -17,7 +17,7 @@ const { safeFetch } = require('./safe-fetch');
 const { boundedQueue, envInt } = require('./concurrency');
 
 const PORT = process.env.PORT || 10000;
-const ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
+const ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://tiksavefast.com,https://www.tiksavefast.com').split(',').map(s => s.trim()).filter(Boolean);
 const PROXY = process.env.YTDLP_PROXY || '';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const HOSTS = /(^|\.)(tiktok\.com|instagram\.com|facebook\.com|fb\.watch|fb\.com|youtube\.com|youtu\.be|x\.com|twitter\.com|reddit\.com|redd\.it|pinterest\.(com|co\.uk|ca|fr|de|es|it|com\.au|jp|co\.kr|ch|at|pt|se|dk|nl|ru|nz|com\.mx|com\.br)|pin\.it|snapchat\.com|threads\.net|threads\.com|vimeo\.com)$/i;
@@ -39,7 +39,7 @@ app.use((req, res, next) => {
   else if (o && ORIGINS.includes(o)) { res.setHeader('Access-Control-Allow-Origin', o); res.setHeader('Vary', 'Origin'); }
   res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Disposition, X-Download-Status');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Disposition, X-Download-Status, X-Media-Verified');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -68,6 +68,7 @@ function findBin() {
 }
 const BIN = findBin();
 const _ff = spawnSync('ffmpeg', ['-version'], { timeout: 8000 });
+const _probe=spawnSync('ffprobe',['-version'],{timeout:5000});
 const HAS_FFMPEG = !_ff.error && _ff.status === 0;
 console.log('yt-dlp binary:', BIN || 'NOT FOUND', '| ffmpeg:', HAS_FFMPEG);
 
@@ -75,11 +76,11 @@ console.log('yt-dlp binary:', BIN || 'NOT FOUND', '| ffmpeg:', HAS_FFMPEG);
 function run(args, timeoutMs, cap = 20 * 1024 * 1024, signal) {
   if (!BIN) return Promise.resolve({ code: -1, out: '', err: 'NO_YTDLP' });
   return new Promise(resolve => {
-    const p = spawn(BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const p = spawn(BIN, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform!=='win32' });
     let out = '', err = '', done = false;
-    const abort=()=>p.kill('SIGKILL');signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
-    const t = setTimeout(() => { if (!done) { err += '\nTIMEOUT'; p.kill('SIGKILL'); } }, timeoutMs);
-    p.stdout.on('data', d => { if(out.length+d.length>cap){err+='\nOUTPUT_LIMIT';p.kill('SIGKILL');}else out+=d; });
+    const abort=()=>{try{if(process.platform!=='win32')process.kill(-p.pid,'SIGKILL');else p.kill('SIGKILL');}catch{}};signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
+    const t = setTimeout(() => { if (!done) { err += '\nTIMEOUT'; abort(); } }, timeoutMs);
+    p.stdout.on('data', d => { if(out.length+d.length>cap){err+='\nOUTPUT_LIMIT';abort();}else out+=d; });
     p.stderr.on('data', d => { if (err.length < 20000) err += d; });
     p.on('error', e => { err += '\n' + e.message; });
     p.on('close', code => { done = true; clearTimeout(t); signal?.removeEventListener('abort',abort); resolve({ code, out, err }); });
@@ -161,7 +162,7 @@ async function extract(url) {
 const baseOf = req => `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
 
 app.get('/', (req, res) => res.send('All-In-One Media Downloader API is running.'));
-app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, cookies: HAS_COOKIES, proxy: !!PROXY, threadsPlugin: true, note: 'threadsPlugin indicates the Docker image is configured to install the Threads extractor; verify Render build logs if Threads still fails.' }));
+app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, ffprobe: !_probe.error && _probe.status===0, cookies: HAS_COOKIES, proxy: !!PROXY, threadsPlugin: true, note: 'threadsPlugin indicates the Docker image is configured to install the Threads extractor; verify Render build logs if Threads still fails.' }));
 
 app.post('/api/download', async (req, res) => {
   if (limited('d:' + req.ip, 20, 60000)) return res.status(429).json({ error: 'Too many requests. Please wait a minute.', code: 'rate_limited' });
@@ -210,11 +211,11 @@ function pipeYtDlp(req, res, s) {
   })).catch(()=>{if(!res.headersSent)res.status(503).json({error:"Download processing is busy. Please retry."});});
 }
 
-const servePrepared=require('./prepared-delivery')({mergeSlot,baseArgs,withCookies,run,explain});
+const servePrepared=require('./prepared-delivery')({mergeSlot,baseArgs,withCookies,run,safeFetch});
 app.head('/api/stream/:id',async(req,res)=>{
  if(limited('head:'+req.ip,180,60000))return res.status(429).end();
  const s=streams.get(req.params.id);if(!s||s.exp<Date.now())return res.status(410).end();
- if(s.mode==='prepare'||s.mode==='pipe'){res.setHeader('X-Download-Status','requires-processing');return res.status(200).end();}
+ if(s.mode==='prepare'||s.mode==='pipe'||s.mediaType==='video'){res.setHeader('X-Download-Status','requires-processing');return res.status(200).end();}
  try{let up=await safeFetch(s.url,{method:'HEAD',headers:s.headers,signal:AbortSignal.timeout(12000)});
  if([403,405,501].includes(up.status)){up=await safeFetch(s.url,{headers:{...s.headers,Range:'bytes=0-0'},signal:AbortSignal.timeout(12000)});}
  if(!up.ok||(s.mediaType!=='caption'&&/text\/html|application\/json/i.test(up.headers.get('content-type')||''))){await up.body?.cancel();return res.status(up.status===404?404:502).end();}
@@ -228,7 +229,7 @@ app.get('/api/stream/:id', async (req, res) => {
   const s = streams.get(req.params.id);
   if (!s || s.exp < Date.now()) return res.status(410).send('Link expired. Fetch the video again.');
   if (s.mode === 'pipe' || !s.url) return pipeYtDlp(req, res, s);
-  if(s.mode==='prepare')return servePrepared(req,res,s);
+  if(s.mode==='prepare'||s.mediaType==='video')return servePrepared(req,res,s);
   const ctrl = new AbortController();
   const deadline=setTimeout(()=>ctrl.abort(),envInt('MEDIA_STREAM_TIMEOUT_MS',300000,1000,600000));
   res.on('close', () => {clearTimeout(deadline);ctrl.abort()});
