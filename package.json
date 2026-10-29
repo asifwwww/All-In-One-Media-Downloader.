@@ -1,9 +1,19 @@
 {
   "name": "media-downloader-api",
-  "version": "2.2.0",
+  "version": "4.0.0",
   "main": "index.js",
-  "engines": { "node": ">=20" },
-  "scripts": { "start": "node index.js" },
-  "dependencies": { "express": "^4.19.2" },
-  "optionalDependencies": { "yt-dlp-exec": "*" }
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ipaddr.js": "^2.2.0"
+  },
+  "optionalDependencies": {
+    "yt-dlp-exec": "*"
+  }
 }
