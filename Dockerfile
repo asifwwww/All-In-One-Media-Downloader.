@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 # python + ffmpeg (merging), deno (YouTube JS challenges), latest yt-dlp with EJS solver
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,7 +14,9 @@ RUN printf -- "--js-runtimes deno\n" > /etc/yt-dlp.conf
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --omit=optional
-COPY *.js ./
+COPY . .
+RUN node check-startup.js --full
 ENV NODE_ENV=production
+ENV NO_UPDATE=1
 EXPOSE 10000
-CMD ["node", "index.js"]
+CMD ["npm", "start"]

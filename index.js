@@ -15,6 +15,8 @@ const path = require('path');
 const { Readable } = require('stream');
 const { safeFetch } = require('./safe-fetch');
 const { boundedQueue, envInt } = require('./concurrency');
+const { platformOf, normalizeVideoURL, videoProblem } = require('./platforms');
+const { registerPlatformRoutes } = require('./platform-routes');
 
 const PORT = process.env.PORT || 10000;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://tiksavefast.com,https://www.tiksavefast.com').split(',').map(s => s.trim()).filter(Boolean);
@@ -23,15 +25,14 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const HOSTS = /(^|\.)(tiktok\.com|instagram\.com|facebook\.com|fb\.watch|fb\.com|youtube\.com|youtu\.be|x\.com|twitter\.com|reddit\.com|redd\.it|pinterest\.(com|co\.uk|ca|fr|de|es|it|com\.au|jp|co\.kr|ch|at|pt|se|dk|nl|ru|nz|com\.mx|com\.br)|pin\.it|snapchat\.com|threads\.net|threads\.com|vimeo\.com)$/i;
 
 // ---------- cookies (optional) ----------
-const COOKIES_FILE = path.join(os.tmpdir(), 'cookies-master.txt');
+const COOKIES_FILE = path.join(os.tmpdir(), 'cookies-master-'+crypto.randomBytes(8).toString('hex')+'.txt');
 let HAS_COOKIES = false;
 if (process.env.COOKIES_B64) {
-  try { fs.writeFileSync(COOKIES_FILE, Buffer.from(process.env.COOKIES_B64, 'base64')); HAS_COOKIES = true; } catch (e) { console.error('cookies:', e.message); }
+  try { fs.writeFileSync(COOKIES_FILE, Buffer.from(process.env.COOKIES_B64, 'base64'), {mode:0o600}); HAS_COOKIES = true; } catch (e) { console.error('cookies:', e.message); }
 }
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '10kb' }));
 app.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');next();});
 app.use((req, res, next) => {
   const o = req.headers.origin;
@@ -43,6 +44,8 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+app.use(express.json({ limit: '10kb' }));
 
 // ---------- tiny rate limiter ----------
 const hits = new Map();
@@ -70,6 +73,8 @@ const BIN = findBin();
 const _ff = spawnSync('ffmpeg', ['-version'], { timeout: 8000 });
 const _probe=spawnSync('ffprobe',['-version'],{timeout:5000});
 const HAS_FFMPEG = !_ff.error && _ff.status === 0;
+const _deno=spawnSync('deno',['--version'],{timeout:5000});
+const HAS_DENO=!_deno.error&&_deno.status===0;
 console.log('yt-dlp binary:', BIN || 'NOT FOUND', '| ffmpeg:', HAS_FFMPEG);
 
 // ---------- yt-dlp runner ----------
@@ -88,7 +93,8 @@ function run(args, timeoutMs, cap = 20 * 1024 * 1024, signal) {
 }
 function baseArgs(url) {
   const a = ['--no-playlist', '--playlist-end', '20', '--no-warnings', '--socket-timeout', '20', '--extractor-retries', '2', '--retries', '3', '--fragment-retries', '3',
-    '--user-agent', UA, '--add-header', 'Accept-Language:en-US,en;q=0.9'];
+    '--ignore-config', '--no-cache-dir', '--user-agent', UA, '--add-header', 'Accept-Language:en-US,en;q=0.9'];
+  if (/youtube\.com|youtu\.be/i.test(url)) a.push('--js-runtimes', 'deno');
   if (/vimeo\.com/i.test(url)) a.push('--referer', 'https://vimeo.com/');
   if (PROXY) a.push('--proxy', PROXY);
   return a;
@@ -103,14 +109,14 @@ function explain(stderr) {
   const s = stderr || '';
   if (/NO_YTDLP/.test(s)) return { code: 'setup', error: 'Server setup problem: yt-dlp is not installed on the server.', hint: 'Deploy with the Dockerfile (Render runtime: Docker) or add yt-dlp-exec.' };
   if (/TIMEOUT/.test(s)) return { code: 'timeout', error: 'The source took too long to respond. Please try again.' };
-  if (/confirm you.re not a bot|Sign in to confirm/i.test(s)) return { code: 'youtube_bot', error: 'YouTube is blocking this server right now.', hint: 'Add COOKIES_B64 or YTDLP_PROXY on Render.' };
-  if (/login required|rate-limit reached|empty media response|Requested content is not available|checkpoint/i.test(s)) return { code: 'login_required', error: 'This platform requires a logged-in session for this link.', hint: 'Add COOKIES_B64 (Netscape cookies.txt) on Render.' };
+  if (/confirm you.re not a bot|Sign in to confirm/i.test(s)) return { code: 'youtube_bot', error: 'YouTube is blocking this server right now.', hint: 'Try again later. Platform login or access restrictions are not bypassed.' };
+  if (/login required|rate-limit reached|empty media response|Requested content is not available|checkpoint/i.test(s)) return { code: 'login_required', error: 'This platform requires a logged-in session for this link.', hint: 'Use an accessible link. These routes do not unlock private content.' };
   if (/Unsupported URL/i.test(s)) {
     if (/threads\.(com|net)/i.test(s)) return { code: 'threads_unsupported', error: 'Threads link could not be extracted by the server.', hint: 'Make sure the latest Docker deployment completed and the Threads yt-dlp plugin loaded. Only public video posts are supported; text/image-only posts cannot be downloaded.' };
     return { code: 'unsupported', error: 'This link type is not supported by the current extractor.' };
   }
   if (/private|unavailable|removed|not exist|404|deleted/i.test(s)) return { code: 'unavailable', error: 'This media is private, removed or unavailable.' };
-  if (/403|Forbidden/i.test(s)) return { code: 'blocked', error: 'The platform blocked the request (HTTP 403).', hint: 'Update yt-dlp, add cookies or a proxy.' };
+  if (/403|Forbidden/i.test(s)) return { code: 'blocked', error: 'The platform blocked the request (HTTP 403).', hint: 'Check the extractor version and try again later; access restrictions are not bypassed.' };
   return { code: 'failed', error: 'Failed to extract. Make sure the link is public and valid.' };
 }
 
@@ -119,6 +125,9 @@ function cleanUrl(raw) {
   if (typeof raw !== 'string' || raw.length > 2000) return null;
   let u; try { u = new URL(raw.trim()); } catch { return null; }
   if (u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443') || !HOSTS.test(u.hostname)) return null;
+  const platform=platformOf(u.toString());
+  if(platform)return normalizeVideoURL(u.toString(),platform);
+  if(/(^|\.)(youtube\.com|youtu\.be|instagram\.com)$/i.test(u.hostname))return null;
   return u.toString();
 }
 
@@ -144,7 +153,8 @@ const cache = new Map(); const inflight = new Map();
 function cacheGet(k) { const c = cache.get(k); if (c && c.exp > Date.now()) return c.info; cache.delete(k); return null; }
 function cacheSet(k, info) { cache.set(k, { info, exp: Date.now() + 10 * 60 * 1000 }); if (cache.size > 150) cache.delete(cache.keys().next().value); }
 
-async function extract(url) {
+async function extract(url, {refresh=false}={}) {
+  if(refresh)cache.delete(url);
   const hit = cacheGet(url); if (hit) return { info: hit };
   if (inflight.has(url)) return inflight.get(url);
   const job = extractSlot(async () => {
@@ -152,25 +162,28 @@ async function extract(url) {
     try {
       const r = await run(c.args, envInt('EXTRACTION_TIMEOUT_MS',45000,1000,180000));
       if (r.code !== 0 || !r.out.trim()) return { error: explain(r.err), raw: r.err.slice(-400) };
-      try { const info = JSON.parse(r.out); cacheSet(url, info); return { info }; }
+      try { const info = JSON.parse(r.out); const problem=platformOf(url)?videoProblem(info):null;if(problem)return {error:{code:problem.code,error:problem.error}};cacheSet(url, info); return { info }; }
       catch { return { error: explain('') }; }
     } finally { c.cleanup(); }
   }).catch(()=>({error:{error:'Extraction queue busy or timed out. Please retry.',code:'busy'}})).finally(() => inflight.delete(url));
   inflight.set(url, job); return job;
 }
 
-const baseOf = req => `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
+const PUBLIC_BASE_URL=process.env.PUBLIC_BASE_URL?new URL(process.env.PUBLIC_BASE_URL).origin:'';
+const baseOf = req => PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
 
 app.get('/', (req, res) => res.send('All-In-One Media Downloader API is running.'));
-app.get('/health', (req, res) => res.json({ ok: !!BIN, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, ffprobe: !_probe.error && _probe.status===0, cookies: HAS_COOKIES, proxy: !!PROXY, threadsPlugin: true, note: 'threadsPlugin indicates the Docker image is configured to install the Threads extractor; verify Render build logs if Threads still fails.' }));
+app.get('/health', (req, res) => res.json({ ok: !!BIN && HAS_FFMPEG && !_probe.error && _probe.status===0 && HAS_DENO, deno: HAS_DENO, platforms: {instagram: true, youtube: true}, ytdlp: YTDLP_VERSION, bin: BIN ? (BIN === 'yt-dlp' ? 'system' : 'yt-dlp-exec') : 'none', ffmpeg: HAS_FFMPEG, ffprobe: !_probe.error && _probe.status===0, cookies: HAS_COOKIES, proxy: !!PROXY, threadsPlugin: true, note: 'threadsPlugin indicates the Docker image is configured to install the Threads extractor; verify Render build logs if Threads still fails.' }));
 
 app.post('/api/download', async (req, res) => {
   if (limited('d:' + req.ip, 20, 60000)) return res.status(429).json({ error: 'Too many requests. Please wait a minute.', code: 'rate_limited' });
   const url = cleanUrl(req.body && req.body.url);
   if (!url) return res.status(400).json({ error: 'Please paste a valid link from a supported platform.', code: 'bad_url' });
-  if(req.body.refresh===true)cache.delete(url);
-  const r = await extract(url);
+  if(req.body.refresh!==undefined&&typeof req.body.refresh!=='boolean')return res.status(400).json({code:'bad_request',error:'refresh must be true or false.'});
+  const r = await extract(url,{refresh:req.body.refresh===true});
   if (r.error) return res.status(r.error.code==='busy'?503:502).json({error:r.error.error||'Extraction failed. Please retry.',code:r.error.code||'extraction_failed'});
+  const platform=platformOf(url);
+  if(platform){const problem=videoProblem(r.info);if(problem)return res.status(problem.status).json({platform,code:problem.code,error:problem.error});}
   try { return res.json(buildResponse(r.info, baseOf(req), url)); }
   catch (e) { console.error('build:', e.message); return res.status(500).json({ error: 'Could not process this media.', code: 'failed' }); }
 });
@@ -277,6 +290,8 @@ function updateYtDlp() {
   p.on('close', () => readVersion().catch(() => {})); p.on('error', () => {});
 }
 require('./extensions')({app, cleanUrl, extract, buildResponse, baseOf, register, streams, limited, safeName, safeFetch, HAS_FFMPEG, mergeSlot, baseArgs, withCookies, run});
+registerPlatformRoutes({app,extract,buildResponse,baseOf,limited});
+app.use((err,req,res,next)=>{if(res.headersSent)return next(err);if(err.type==='entity.parse.failed')return res.status(400).json({code:'bad_json',error:'Send a valid JSON body.'});if(err.type==='entity.too.large')return res.status(413).json({code:'body_too_large',error:'Request body is too large.'});console.error('request error:',err.message);return res.status(500).json({code:'server_error',error:'The request could not be processed.'});});
 
 if (require.main === module) app.listen(PORT, () => {
   console.log('Server running on port ' + PORT);

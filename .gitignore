@@ -1,0 +1,8 @@
+
+.backend-update-backup-*/
+node_modules/
+.env
+.env.*
+!.env.example
+cookies.txt
+cookies-*.txt

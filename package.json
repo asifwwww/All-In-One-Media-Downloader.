@@ -1,13 +1,15 @@
 {
   "name": "media-downloader-api",
-  "version": "4.0.0",
+  "version": "5.1.0",
   "main": "index.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=22 <25"
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "prestart": "node check-startup.js --full",
+    "check": "node check-startup.js --full"
   },
   "dependencies": {
     "express": "^4.19.2",

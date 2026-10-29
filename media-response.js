@@ -22,7 +22,7 @@ function makeBuilder({register,HAS_FFMPEG,safeName}){
   }
   const meta=metadata(info,pageUrl),all=Array.isArray(info.formats)&&info.formats.length?info.formats:info.url?[{...info,format_id:info.format_id||'single'}]:[];
   const output=[],omitted=[],seen=new Map();const title=info.title||info.description||'';const name=safeName(title||'media');
-  const audio=all.filter(f=>mediaURL(f.url)&&f.vcodec==='none'&&f.acodec&&f.acodec!=='none').sort((a,b)=>(b.abr||0)-(a.abr||0))[0];
+  const audio=all.filter(f=>f.has_drm!==true&&f.format_id&&mediaURL(f.url)&&f.vcodec==='none'&&f.acodec&&f.acodec!=='none').sort((a,b)=>(b.abr||0)-(a.abr||0))[0];
   function add(f,{type,selector,kind='direct',ext=f.ext,hasAudio,quality,sourceFingerprint,watermark}={}){
    const upstream=mediaURL(f.url);if(!upstream||(!f.format_id&&kind!=='direct')){omitted.push('unsupported or unidentifiable source format');return;}
    const container=containers.has(String(ext||'').toLowerCase())?String(ext).toLowerCase():null;
@@ -33,11 +33,12 @@ function makeBuilder({register,HAS_FFMPEG,safeName}){
    const size=kind==='direct'?positive(f.filesize)||positive(f.filesize_approx):null,sizeKind=kind==='direct'?(positive(f.filesize)?'exact':positive(f.filesize_approx)?'estimated':'unknown'):'unknown';
    const entry={quality:q,ext:container,size:size||0,sizeKind,kind,mediaType:type,width,height,fps,hasAudio,watermark:typeof watermark==='boolean'?watermark:null,sourceFingerprint:sf,equivalenceKey:equivalent,formatId:String(f.format_id||'source-'+identity(upstream).slice(0,12)),bitrate:bitrate||null};
    const prior=seen.get(equivalent);if(prior&&((prior.kind==='direct'&&kind!=='direct')||(prior.kind===kind&&(prior.bitrate||0)>=(entry.bitrate||0))))return;
-   const plan={pageUrl,formatId:selector||String(f.format_id),mode:kind==='direct'?'direct':'prepare',outputExt:container,mediaType:type,expectedHeight:height,strictFormat:true};
+   const plan={pageUrl,formatId:selector||String(f.format_id),mode:kind==='direct'?'direct':'prepare',requireAudio:type==='video'?hasAudio!==false:undefined,outputExt:container,mediaType:type,expectedHeight:height,strictFormat:true};
    const id=register(upstream,f.http_headers||info.http_headers,name+(container?'.'+container:'.bin'),plan);entry.url=base+'/api/stream/'+id+'?dl=1';
    if(prior)output.splice(output.indexOf(prior),1);seen.set(equivalent,entry);output.push(entry);
   }
   for(const f of all){
+   if(f.has_drm===true){omitted.push('protected media is not supported');continue;}
    if(!mediaURL(f.url)){omitted.push('non-HTTPS or missing media URL');continue;}
    const ext=String(f.ext||'').toLowerCase(),img=imageExt.test(ext),v=!img&&f.vcodec!=='none'&&(!!f.vcodec||positive(f.height)||positive(f.width)),a=!img&&f.acodec!=='none'&&!!f.acodec;
    const direct=!/m3u8|dash|f4m|ism/i.test(f.protocol||'')&&!/^(m3u8|mpd|f4m)$/.test(ext);
