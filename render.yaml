@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: video-downloader-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: "*"          # later: https://tiksavefast.com,https://www.tiksavefast.com
+      - key: COOKIES_B64    # optional: base64 of a Netscape cookies.txt (Instagram/Threads/YouTube)
+        sync: false
+      - key: YTDLP_PROXY    # optional: http://user:pass@host:port
+        sync: false
